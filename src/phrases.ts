@@ -1,0 +1,23 @@
+export const loadingPhrases = [
+  "Oogey boogey…",
+  "Great Scott!",
+  "Dr. Livingstone, I presume?",
+  "Cross-examining clause 12…",
+  "Objection… overruled.",
+  "Reading the fine print so you don't have to…",
+  "Asking both clauses to tell the truth…",
+  "Summoning the smallest possible troublemaker…",
+  "Compiling hope into tests…",
+  "To be, or not to be, that is the clause...",
+  "It is a truth universally acknowledged, that a single clause must want a fix...",
+  "Call me Ishmael, but this clause is a white whale...",
+  "The first thing we do, let's test all the clauses...",
+  "Elementary, my dear Watson, the parameters contradict themselves!",
+  "There is no place like 127.0.0.1...",
+  "Off with their clauses!",
+  "All animals are equal, but some clauses are more equal than others...",
+  "A person's a person, no matter how small; a clause is a clause, no matter how nested...",
+  "Frankly, my dear, I don't give a damn... about unreferenced dimensions.",
+  "I am large, I contain multitudes of edge cases...",
+  "Happy families are all alike; every unhappy clause is unhappy in its own way..."
+];
