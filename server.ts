@@ -3,9 +3,17 @@ import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
-import vm from "node:vm";
 import dotenv from "dotenv";
 import { createRequire } from "module";
+import {
+  enrichDimensions,
+  generateSyntheticCases,
+  getDimensionValues,
+  runEvaluation,
+  detectDefects,
+  stripHtml,
+} from "./server/engine";
+import { createSavedAnalysesRouter } from "./server/savedAnalyses";
 
 const require = createRequire(import.meta.url);
 const pdf = require("pdf-parse");
@@ -27,191 +35,6 @@ const ai = new GoogleGenAI({
     },
   },
 });
-
-// Mulberry32 PRNG (Fixed Seed)
-function mulberry32(a: number) {
-  return function() {
-    let t = a += 0x6D2B79F5;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-// Helper to extract or generate dimension values from either values or range with full boundary sweeps
-function getDimensionValues(dim: any): string[] {
-  const vals: string[] = [];
-  const rawSources = [...(dim.values || []), ...(dim.range || [])];
-  
-  if (dim.kind === "numeric") {
-    const numbers = rawSources.map((v: any) => parseFloat(v)).filter((n: any) => !isNaN(n));
-    if (numbers.length > 0) {
-      numbers.forEach((n: number) => {
-        vals.push(String(n - 1));
-        vals.push(String(n));
-        vals.push(String(n + 1));
-      });
-    } else {
-      vals.push("0", "5", "10", "11", "50", "100");
-    }
-    return [...new Set(vals)];
-  } else if (dim.kind === "datetime") {
-    rawSources.forEach((r: any) => {
-      vals.push(String(r));
-    });
-    if (vals.length === 0) {
-      vals.push("2026-01-01T00:00:00Z", "2026-07-17T00:00:00Z");
-    }
-    return [...new Set(vals)];
-  } else {
-    // categorical
-    rawSources.forEach((r: any) => {
-      vals.push(String(r));
-    });
-    if (vals.length === 0) {
-      vals.push("default");
-    }
-    return [...new Set(vals)];
-  }
-}
-
-// Programmatically enrich dimensions from extracted thresholds and categories to maximize recall
-function enrichDimensions(dimensions: any[], thresholds: any[], categories: any[]): any[] {
-  const dims = [...(dimensions || [])];
-
-  // 1. Enrich from thresholds
-  if (thresholds && thresholds.length > 0) {
-    thresholds.forEach(t => {
-      if (!t.dimension || !t.thresholdValue) return;
-      const dimName = t.dimension.trim();
-      let d = dims.find(x => x.name.toLowerCase() === dimName.toLowerCase());
-      if (!d) {
-        // Create new numeric/datetime dimension
-        const isDate = String(t.thresholdValue).includes("-") || String(t.thresholdValue).includes(":") || isNaN(Number(t.thresholdValue));
-        d = {
-          name: dimName,
-          kind: isDate ? "datetime" : "numeric",
-          values: [],
-          range: []
-        };
-        dims.push(d);
-      }
-      
-      // Make sure the threshold value is in values / range
-      if (!d.values) d.values = [];
-      if (!d.range) d.range = [];
-      
-      const valStr = String(t.thresholdValue).trim();
-      if (!d.values.includes(valStr)) {
-        d.values.push(valStr);
-      }
-      if (!d.range.includes(valStr)) {
-        d.range.push(valStr);
-      }
-    });
-  }
-
-  // 2. Enrich from categories
-  if (categories && categories.length > 0) {
-    let planDim = dims.find(x => x.kind === "categorical" || x.name.toLowerCase() === "plan" || x.name.toLowerCase() === "tier");
-    if (!planDim) {
-      planDim = {
-        name: "plan",
-        kind: "categorical",
-        values: [],
-        range: []
-      };
-      dims.push(planDim);
-    }
-    if (!planDim.values) planDim.values = [];
-    categories.forEach(c => {
-      if (!c.categoryName) return;
-      const catVal = c.categoryName.trim();
-      if (!planDim.values.includes(catVal)) {
-        planDim.values.push(catVal);
-      }
-    });
-  }
-
-  return dims;
-}
-
-// Generate synthetic cases ensuring boundary coverage
-function generateSyntheticCases(dimensions: any[]) {
-  const rng = mulberry32(42);
-  const cases: any[] = [];
-  const targetCount = 500;
-
-  if (!dimensions || dimensions.length === 0) {
-    return [];
-  }
-
-  // Create guaranteed coverage cases first
-  for (let i = 0; i < dimensions.length; i++) {
-    const dim = dimensions[i];
-    const vals = getDimensionValues(dim);
-    for (const val of vals) {
-      const attrs: any = {};
-      for (let j = 0; j < dimensions.length; j++) {
-        if (i === j) {
-          attrs[dimensions[j].name] = val;
-        } else {
-          const otherVals = getDimensionValues(dimensions[j]);
-          const idx = Math.floor(rng() * otherVals.length);
-          attrs[dimensions[j].name] = otherVals[idx] || "";
-        }
-      }
-      cases.push({
-        caseId: `case-${cases.length + 1}`,
-        attributes: attrs,
-      });
-    }
-  }
-
-  // Generate remaining cases up to targetCount
-  while (cases.length < targetCount) {
-    const attrs: any = {};
-    for (const dim of dimensions) {
-      const vals = getDimensionValues(dim);
-      const idx = Math.floor(rng() * vals.length);
-      attrs[dim.name] = vals[idx] || "";
-    }
-    cases.push({
-      caseId: `case-${cases.length + 1}`,
-      attributes: attrs,
-    });
-  }
-
-  // Generate plain-English descriptions (never the model)
-  for (const c of cases) {
-    const parts = Object.entries(c.attributes).map(([k, v]) => `${k} is "${v}"`);
-    c.description = `A test case scenario where ${parts.join(" and ")}.`;
-  }
-
-  return cases;
-}
-
-// Run evaluation code in vm sandbox
-function runEvaluation(code: string, caseObj: any, rules: any[], appliedFixIds: string[]) {
-  const sandbox = {
-    caseObj,
-    rules,
-    appliedFixIds,
-    result: null as any,
-  };
-  const context = vm.createContext(sandbox);
-  const codeToRun = `
-    (function() {
-      const evaluate = (caseObj, rules, appliedFixIds) => {
-        ${code}
-      };
-      result = evaluate(caseObj, rules, appliedFixIds);
-    })();
-  `;
-  const script = new vm.Script(codeToRun);
-  script.runInContext(context, { timeout: 5000 });
-  return sandbox.result;
-}
 
 // Gemini Repair Call
 async function repairEvaluationCode(badCode: string, errorMessage: string, documentText: string): Promise<string> {
@@ -240,160 +63,6 @@ for each rule in \`rules\`. Do not include any imports, I/O, or Date.now. Return
   return text;
 }
 
-// Mechanical defect detection (Step 4) with robust dimension-isolated sweeps
-function detectDefects(cases: any[], rules: any[], currentCode: string, dimensions: any[]) {
-  const defects: any[] = [];
-  const caseEvaluations: any[] = [];
-
-  const referencedDims = new Set<string>();
-  for (const d of dimensions) {
-    for (const r of rules) {
-      if (r.clauseText.toLowerCase().includes(d.name.toLowerCase())) {
-        referencedDims.add(d.name);
-      }
-    }
-  }
-
-  // Group rules by dimension they reference
-  const dimRules = new Map<string, any[]>();
-  for (const d of dimensions) {
-    const list: any[] = [];
-    const dName = d.name.toLowerCase();
-    for (const r of rules) {
-      const text = r.clauseText.toLowerCase();
-      // Heuristic text matches for dimensions
-      const matches = text.includes(dName) || 
-                      (dName === "seats" && text.includes("seat")) || 
-                      (dName === "plan" && (text.includes("plan") || text.includes("standard") || text.includes("enterprise") || text.includes("education"))) ||
-                      (dName === "submission_channel" && (text.includes("portal") || text.includes("email") || text.includes("channel") || text.includes("submit"))) ||
-                      (dName === "refundrequestedday" && (text.includes("refund") || text.includes("day") || text.includes("within")));
-      if (matches) {
-        list.push(r);
-      }
-    }
-    dimRules.set(d.name, list);
-  }
-
-  for (const C of cases) {
-    try {
-      const results = runEvaluation(currentCode, C, rules, []);
-      caseEvaluations.push({
-        caseId: C.caseId,
-        caseObj: C,
-        results: results || [],
-      });
-    } catch (e: any) {
-      // Log evaluation error
-    }
-  }
-
-  for (const evalObj of caseEvaluations) {
-    const { caseId, caseObj, results } = evalObj;
-    
-    // 1. CONTRADICTIONS (major)
-    const activeLiteral = results.filter((r: any) => r.appliesLiteral);
-    const activeScoped = results.filter((r: any) => r.appliesScoped);
-
-    const litOutcomes = activeLiteral.map((r: any) => r.outcome).filter((o: any) => o !== null);
-    const scopedOutcomes = activeScoped.map((r: any) => r.outcome).filter((o: any) => o !== null);
-
-    const uniqueLit = [...new Set(litOutcomes)];
-    const uniqueScoped = [...new Set(scopedOutcomes)];
-
-    const isLitContradiction = uniqueLit.length > 1;
-    const isScopedContradiction = uniqueScoped.length > 1;
-
-    const isContradiction = isLitContradiction && isScopedContradiction;
-    if (isContradiction) {
-      defects.push({
-        kind: "contradiction",
-        caseId,
-        rulesInvolved: results.filter((r: any) => r.appliesLiteral || r.appliesScoped).map((r: any) => r.ruleId),
-      });
-    }
-
-    // 2. SCOPE AMBIGUITY (minor)
-    const litStr = JSON.stringify(uniqueLit.sort());
-    const scopedStr = JSON.stringify(uniqueScoped.sort());
-    const hasDisagreement = results.some((r: any) => r.appliesLiteral !== r.appliesScoped);
-    if (hasDisagreement && litStr !== scopedStr) {
-      defects.push({
-        kind: "scope_ambiguity",
-        caseId,
-        rulesInvolved: results.filter((r: any) => r.appliesLiteral !== r.appliesScoped).map((r: any) => r.ruleId),
-      });
-    }
-
-    // 3. DIMENSION-ISOLATED MISSING OUTCOME & BOUNDARY COLLISION
-    for (const d of dimensions) {
-      const rList = dimRules.get(d.name) || [];
-      if (rList.length === 0) continue; // No rules cover this dimension
-
-      // Check if any rule associated with this dimension applies to this case
-      const dResults = results.filter((r: any) => rList.some((rl: any) => rl.id === r.ruleId));
-      const activeLitD = dResults.filter((r: any) => r.appliesLiteral);
-      const activeScopedD = dResults.filter((r: any) => r.appliesScoped);
-
-      const isMissingD = (activeLitD.length === 0) || (activeScopedD.length === 0);
-      if (isMissingD) {
-        // We found a gap for this dimension!
-        defects.push({
-          kind: "missing_outcome",
-          caseId,
-          rulesInvolved: [],
-        });
-
-        // If this dimension is numeric or datetime, and the value is a boundary value, flag as boundary_collision
-        if (d.kind === "numeric" || d.kind === "datetime") {
-          const val = caseObj.attributes[d.name];
-          const vals = getDimensionValues(d);
-          const isBoundary = vals.includes(String(val)) || vals.includes(val);
-          if (isBoundary) {
-            defects.push({
-              kind: "boundary_collision",
-              caseId,
-              rulesInvolved: rList.map((r: any) => r.id),
-            });
-          }
-        }
-      }
-    }
-  }
-
-  // 4. COUNTERFACTUAL PARITY (major)
-  for (let i = 0; i < caseEvaluations.length; i++) {
-    for (let j = i + 1; j < caseEvaluations.length; j++) {
-      const cA = caseEvaluations[i];
-      const cB = caseEvaluations[j];
-
-      let differingDim = null;
-      let diffCount = 0;
-      for (const d of dimensions) {
-        if (cA.caseObj.attributes[d.name] !== cB.caseObj.attributes[d.name]) {
-          diffCount++;
-          differingDim = d.name;
-        }
-      }
-
-      if (diffCount === 1 && differingDim && !referencedDims.has(differingDim)) {
-        const outA = JSON.stringify([...new Set(cA.results.filter((r: any) => r.appliesLiteral).map((r: any) => r.outcome).filter(Boolean))].sort());
-        const outB = JSON.stringify([...new Set(cB.results.filter((r: any) => r.appliesLiteral).map((r: any) => r.outcome).filter(Boolean))].sort());
-
-        if (outA !== outB) {
-          defects.push({
-            kind: "counterfactual_parity",
-            caseId: cA.caseId,
-            rulesInvolved: [],
-          });
-          break;
-        }
-      }
-    }
-  }
-
-  return defects;
-}
-
 // Fetch and strip HTML helper
 async function fetchAndStripUrl(urlStr: string): Promise<string> {
   const response = await fetch(urlStr, {
@@ -407,19 +76,7 @@ async function fetchAndStripUrl(urlStr: string): Promise<string> {
   }
   const html = await response.text();
 
-  let text = html
-    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
-    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/\s+/g, " ")
-    .trim();
-
-  return text;
+  return stripHtml(html);
 }
 
 // Response Schema for Structured JSON
@@ -1075,12 +732,7 @@ Please compile the structured compliance checklist, missing scenarios, and refer
   }
 });
 
-// --- Saved Analyses DB (In-Memory) ---
-let savedAnalyses: any[] = [];
-
-app.get("/api/saved-analyses", (req, res) => {
-  res.json(savedAnalyses);
-});
+app.use("/api/saved-analyses", createSavedAnalysesRouter());
 
 app.post("/api/parse", async (req, res) => {
   try {
@@ -1103,81 +755,6 @@ app.post("/api/parse", async (req, res) => {
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to parse" });
   }
-});
-
-app.post("/api/saved-analyses", (req, res) => {
-  const { id, title, text, analysisData } = req.body;
-  if (!title || !text || !analysisData) {
-    return res.status(400).json({ error: "Missing title, text, or analysisData" });
-  }
-  
-  if (id) {
-    const existingIndex = savedAnalyses.findIndex(d => d.id === id);
-    if (existingIndex >= 0) {
-      savedAnalyses[existingIndex] = {
-        ...savedAnalyses[existingIndex],
-        title,
-        text,
-        analysisData,
-        lastUpdated: Date.now()
-      };
-      
-      // Cascade to downstreams
-      savedAnalyses.forEach(doc => {
-        if (doc.upstreamId === id) {
-          doc.lastUpdated = Date.now();
-          // Add a dummy finding to show the cascade effect
-          if (!doc.analysisData.findings.some((f: any) => f.id === "F-CASCADE")) {
-             doc.analysisData.findings.push({
-               id: "F-CASCADE",
-               severity: "major",
-               kind: "boundary_collision",
-               title: "Cascade Update from Upstream",
-               originalText: doc.text.substring(0, 30),
-               occurrence: 1,
-               replacementText: "Updated due to upstream change.",
-               explanation: "An upstream linked document was updated, which may affect clauses in this document.",
-               evidenceCaseIds: [],
-               status: "open"
-             });
-             doc.analysisData.score = Math.max(0, doc.analysisData.score - 15);
-          }
-        }
-      });
-      return res.status(200).json(savedAnalyses[existingIndex]);
-    }
-  }
-
-  const newId = "sa_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
-  const newDoc = {
-    id: newId,
-    title,
-    text,
-    analysisData,
-    lastUpdated: Date.now()
-  };
-  
-  savedAnalyses.push(newDoc);
-  res.status(201).json(newDoc);
-});
-
-app.put("/api/saved-analyses/:id/link", (req, res) => {
-  const { id } = req.params;
-  const { upstreamId } = req.body;
-  
-  const doc = savedAnalyses.find(d => d.id === id);
-  if (!doc) {
-    return res.status(404).json({ error: "Document not found" });
-  }
-  
-  doc.upstreamId = upstreamId;
-  res.json(doc);
-});
-
-app.delete("/api/saved-analyses/:id", (req, res) => {
-  const { id } = req.params;
-  savedAnalyses = savedAnalyses.filter(d => d.id !== id);
-  res.json({ success: true });
 });
 // -------------------------------------
 
